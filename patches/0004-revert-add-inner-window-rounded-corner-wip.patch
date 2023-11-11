@@ -1,0 +1,212 @@
+From 7c91716f8979ccd8604d71c5922b23d954be3e3c Mon Sep 17 00:00:00 2001
+From: nenw <khi@nenw.dev>
+Date: Sat, 11 Nov 2023 18:52:04 +0900
+Subject: [PATCH 4/5] revert: add inner window rounded-corner (wip)
+
+This reverts commit 14d4104da2bd7bc234b38e63fe5de5ccf0cdbd9e.
+---
+ alacritty/src/config/window.rs           |  4 --
+ alacritty/src/display/mod.rs             |  2 -
+ alacritty/src/renderer/mod.rs            | 20 +-----
+ alacritty/src/renderer/rounded_corner.rs | 90 ------------------------
+ 4 files changed, 1 insertion(+), 115 deletions(-)
+ delete mode 100644 alacritty/src/renderer/rounded_corner.rs
+
+diff --git a/alacritty/src/config/window.rs b/alacritty/src/config/window.rs
+index d281ebdf..99e6c779 100644
+--- a/alacritty/src/config/window.rs
++++ b/alacritty/src/config/window.rs
+@@ -50,9 +50,6 @@ pub struct WindowConfig {
+     /// Request blur behind the window.
+     pub blur: bool,
+ 
+-    /// Terminal corner radius
+-    pub inner_radius: u32,
+-
+     /// Controls which `Option` key should be treated as `Alt`.
+     #[cfg(target_os = "macos")]
+     option_as_alt: OptionAsAlt,
+@@ -79,7 +76,6 @@ impl Default for WindowConfig {
+             identity: Default::default(),
+             dimensions: Default::default(),
+             decorations: Default::default(),
+-            inner_radius: Default::default(),
+             startup_mode: Default::default(),
+             dynamic_padding: Default::default(),
+             resize_increments: Default::default(),
+diff --git a/alacritty/src/display/mod.rs b/alacritty/src/display/mod.rs
+index 16ce39de..286d188d 100644
+--- a/alacritty/src/display/mod.rs
++++ b/alacritty/src/display/mod.rs
+@@ -1007,8 +1007,6 @@ impl Display {
+             self.draw_hyperlink_preview(config, cursor_point, display_offset);
+         }
+ 
+-        self.renderer.draw_rounded_corner(&size_info, config.window.inner_radius);
+-
+         // Notify winit that we're about to present.
+         self.window.pre_present_notify();
+ 
+diff --git a/alacritty/src/renderer/mod.rs b/alacritty/src/renderer/mod.rs
+index fbef9922..8eea426d 100644
+--- a/alacritty/src/renderer/mod.rs
++++ b/alacritty/src/renderer/mod.rs
+@@ -21,13 +21,11 @@ use crate::display::SizeInfo;
+ use crate::gl;
+ use crate::renderer::rects::{RectRenderer, RenderRect};
+ use crate::renderer::shader::ShaderError;
+-use crate::renderer::rounded_corner::RoundedCornerRenderer;
+ 
+ pub mod platform;
+ pub mod rects;
+ mod shader;
+ mod text;
+-mod rounded_corner;
+ 
+ pub use text::{GlyphCache, LoaderApi};
+ 
+@@ -85,7 +83,6 @@ enum TextRendererProvider {
+ pub struct Renderer {
+     text_renderer: TextRendererProvider,
+     rect_renderer: RectRenderer,
+-    rounded_corner_renderer: RoundedCornerRenderer,
+ }
+ 
+ impl Renderer {
+@@ -140,8 +137,6 @@ impl Renderer {
+             (text_renderer, rect_renderer)
+         };
+ 
+-        let rounded_corner_renderer = RoundedCornerRenderer::new();
+-
+         // Enable debug logging for OpenGL as well.
+         if log::max_level() >= LevelFilter::Debug && GlExtensions::contains("GL_KHR_debug") {
+             debug!("Enabled debug logging for OpenGL");
+@@ -152,7 +147,7 @@ impl Renderer {
+             }
+         }
+ 
+-        Ok(Self { text_renderer, rect_renderer, rounded_corner_renderer })
++        Ok(Self { text_renderer, rect_renderer })
+     }
+ 
+     pub fn draw_cells<I: Iterator<Item = RenderableCell>>(
+@@ -246,19 +241,6 @@ impl Renderer {
+         }
+     }
+ 
+-    pub fn draw_rounded_corner(&mut self, size_info: &SizeInfo, r: u32) {
+-        unsafe {
+-            // Force alpha
+-            gl::BlendFuncSeparate(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA, gl::SRC_ALPHA, gl::ZERO);
+-        }
+-        self.rounded_corner_renderer.prepare_rects(size_info, r);
+-        self.rounded_corner_renderer.draw();
+-        unsafe {
+-            // Reset blending strategy.
+-            gl::BlendFunc(gl::SRC1_COLOR, gl::ONE_MINUS_SRC1_COLOR);
+-        }
+-    }
+-
+     /// Fill the window with `color` and `alpha`.
+     pub fn clear(&self, color: Rgb, alpha: f32) {
+         unsafe {
+diff --git a/alacritty/src/renderer/rounded_corner.rs b/alacritty/src/renderer/rounded_corner.rs
+deleted file mode 100644
+index d4a9c347..00000000
+--- a/alacritty/src/renderer/rounded_corner.rs
++++ /dev/null
+@@ -1,90 +0,0 @@
+-use std::mem;
+-
+-use crate::display::SizeInfo;
+-use crate::gl;
+-use crate::gl::types::*;
+-
+-#[repr(C)]
+-#[derive(Debug, Clone, Copy)]
+-struct Vertex {
+-    x: f32,
+-    y: f32,
+-}
+-
+-#[derive(Debug)]
+-pub struct RoundedCornerRenderer {
+-    vbo: GLuint,
+-    vertices: Vec<Vertex>,
+-}
+-
+-impl RoundedCornerRenderer {
+-    pub fn new() -> Self {
+-        let mut vbo: GLuint = 0;
+-
+-        unsafe {
+-            gl::GenBuffers(1, &mut vbo);
+-            gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
+-            gl::VertexAttribPointer(
+-                0,
+-                2,
+-                gl::FLOAT,
+-                gl::FALSE,
+-                16,
+-                0 as *const _,
+-            );
+-            gl::EnableVertexAttribArray(0);
+-            gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+-        }
+-
+-        return Self {
+-            vbo,
+-            vertices: Default::default(),
+-        };
+-    }
+-
+-    pub fn prepare_rects(&mut self, size_info: &SizeInfo, radius: u32) {
+-        self.vertices.clear();
+-        let radius_w = (radius as f32) / size_info.width();
+-        let radius_h = (radius as f32) / size_info.height();
+-
+-        for display_clockwise in 0..5 {
+-            let offset_x = match display_clockwise { 0 | 2 | 4 => -1., 1 | 3 | 5 => 1.,  _ => 0. } * (1. - radius_w);
+-            let offset_y = match display_clockwise { 0 | 1 | 3 => 1.,  2 | 4 | 5 => -1., _ => 0. } * (1. - radius_h);
+-            for rect_clockwise in 0..5 {
+-                let rect_x = match rect_clockwise { 0 | 2 | 4 => 0., 1 | 3 | 5 => 1., _ => 0. } * radius_w;
+-                let rect_y = match rect_clockwise { 0 | 1 | 3 => 1., 2 | 4 | 5 => 0., _ => 0. } * radius_h;
+-                self.vertices.push(Vertex { x: offset_x + rect_x, y: offset_y + rect_y });
+-            }
+-        }
+-
+-        unsafe {
+-            gl::BindBuffer(gl::ARRAY_BUFFER, self.vbo);
+-            gl::BufferData(
+-                gl::ARRAY_BUFFER,
+-                (self.vertices.len() * mem::size_of::<Vertex>()) as isize,
+-                self.vertices.as_ptr() as *const _,
+-                gl::STREAM_DRAW,
+-            );
+-            gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+-        }
+-    }
+-
+-    pub fn draw(&mut self) {
+-        // let program = &self.programs[rect_kind as usize];
+-        unsafe {
+-            gl::BindBuffer(gl::ARRAY_BUFFER, self.vbo);
+-            // gl::UseProgram(program.id());
+-            gl::DrawArrays(gl::TRIANGLES, 0, self.vertices.len() as i32);
+-            // gl::UseProgram(0);
+-            gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+-        }
+-    }
+-}
+-
+-impl Drop for RoundedCornerRenderer {
+-    fn drop(&mut self) {
+-        unsafe {
+-            gl::DeleteBuffers(1, &self.vbo);
+-        }
+-    }
+-}
+-- 
+2.41.0
+

@@ -1,0 +1,25 @@
+From 17461a68a2f2d8403074615945bbfbd84b066569 Mon Sep 17 00:00:00 2001
+From: nenw <khi@nenw.dev>
+Date: Sat, 11 Nov 2023 14:59:57 +0900
+Subject: [PATCH 1/5] feat: add blur to window
+
+---
+ alacritty/src/window_context.rs | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/alacritty/src/window_context.rs b/alacritty/src/window_context.rs
+index be8eba47..8e9744ca 100644
+--- a/alacritty/src/window_context.rs
++++ b/alacritty/src/window_context.rs
+@@ -112,6 +112,8 @@ impl WindowContext {
+             &options.window_tabbing_id,
+         )?;
+ 
++        window.set_blur(true);
++
+         // Create context.
+         let gl_context =
+             renderer::platform::create_gl_context(&gl_display, &gl_config, raw_window_handle)?;
+-- 
+2.41.0
+

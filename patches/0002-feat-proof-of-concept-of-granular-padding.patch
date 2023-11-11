@@ -1,0 +1,580 @@
+From daab8233c1364240d288646727435a1911367811 Mon Sep 17 00:00:00 2001
+From: nenw <khi@nenw.dev>
+Date: Sat, 11 Nov 2023 15:47:01 +0900
+Subject: [PATCH 2/5] feat: proof-of-concept of granular padding
+
+---
+ alacritty/src/config/ui_config.rs  | 13 +++++
+ alacritty/src/config/window.rs     | 14 ++---
+ alacritty/src/display/cursor.rs    |  4 +-
+ alacritty/src/display/damage.rs    |  4 +-
+ alacritty/src/display/mod.rs       | 84 ++++++++++++++++++++----------
+ alacritty/src/display/window.rs    |  4 +-
+ alacritty/src/event.rs             |  4 +-
+ alacritty/src/input.rs             | 14 ++---
+ alacritty/src/message_bar.rs       | 26 ++++-----
+ alacritty/src/renderer/mod.rs      |  8 +--
+ alacritty/src/renderer/rects.rs    |  9 ++--
+ alacritty/src/renderer/text/mod.rs | 10 ++--
+ 12 files changed, 121 insertions(+), 73 deletions(-)
+
+diff --git a/alacritty/src/config/ui_config.rs b/alacritty/src/config/ui_config.rs
+index a76bbb78..b848081e 100644
+--- a/alacritty/src/config/ui_config.rs
++++ b/alacritty/src/config/ui_config.rs
+@@ -290,6 +290,19 @@ pub struct Delta<T: Default> {
+     pub y: T,
+ }
+ 
++/// A inset in a 2 dimensional plane.
++#[derive(ConfigDeserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct Inset<T: Default> {
++    /// Distance from top edge.
++    pub top: T,
++    /// Distance from right edge.
++    pub right: T,
++    /// Distance from bottom edge.
++    pub bottom: T,
++    /// Distance from left edge.
++    pub left: T,
++}
++
+ /// Regex terminal hints.
+ #[derive(ConfigDeserialize, Clone, Debug, PartialEq, Eq)]
+ pub struct Hints {
+diff --git a/alacritty/src/config/window.rs b/alacritty/src/config/window.rs
+index 3ae4e29e..99e6c779 100644
+--- a/alacritty/src/config/window.rs
++++ b/alacritty/src/config/window.rs
+@@ -10,7 +10,7 @@ use winit::platform::macos::OptionAsAlt as WinitOptionAsAlt;
+ 
+ use alacritty_config_derive::{ConfigDeserialize, SerdeReplace};
+ 
+-use crate::config::ui_config::{Delta, Percentage};
++use crate::config::ui_config::{Delta, Inset, Percentage};
+ use crate::config::LOG_TARGET_CONFIG;
+ 
+ /// Default Alacritty name, used for window title and class.
+@@ -58,7 +58,7 @@ pub struct WindowConfig {
+     pub resize_increments: bool,
+ 
+     /// Pixel padding.
+-    padding: Delta<u16>,
++    padding: Inset<u16>,
+ 
+     /// Initial dimensions.
+     dimensions: Dimensions,
+@@ -120,10 +120,12 @@ impl WindowConfig {
+     }
+ 
+     #[inline]
+-    pub fn padding(&self, scale_factor: f32) -> (f32, f32) {
+-        let padding_x = (f32::from(self.padding.x) * scale_factor).floor();
+-        let padding_y = (f32::from(self.padding.y) * scale_factor).floor();
+-        (padding_x, padding_y)
++    pub fn padding(&self, scale_factor: f32) -> (f32, f32, f32, f32) {
++        let padding_top = (f32::from(self.padding.top) * scale_factor).floor();
++        let padding_right = (f32::from(self.padding.right) * scale_factor).floor();
++        let padding_bottom = (f32::from(self.padding.bottom) * scale_factor).floor();
++        let padding_left = (f32::from(self.padding.left) * scale_factor).floor();
++        (padding_top, padding_right, padding_bottom, padding_left)
+     }
+ 
+     #[inline]
+diff --git a/alacritty/src/display/cursor.rs b/alacritty/src/display/cursor.rs
+index 65933ccc..ee9d51f2 100644
+--- a/alacritty/src/display/cursor.rs
++++ b/alacritty/src/display/cursor.rs
+@@ -16,8 +16,8 @@ pub trait IntoRects {
+ impl IntoRects for RenderableCursor {
+     fn rects(self, size_info: &SizeInfo, thickness: f32) -> CursorRects {
+         let point = self.point();
+-        let x = point.column.0 as f32 * size_info.cell_width() + size_info.padding_x();
+-        let y = point.line as f32 * size_info.cell_height() + size_info.padding_y();
++        let x = point.column.0 as f32 * size_info.cell_width() + size_info.padding_left();
++        let y = point.line as f32 * size_info.cell_height() + size_info.padding_top();
+ 
+         let mut width = size_info.cell_width();
+         let height = size_info.cell_height();
+diff --git a/alacritty/src/display/damage.rs b/alacritty/src/display/damage.rs
+index 82230dff..8e1ee8b9 100644
+--- a/alacritty/src/display/damage.rs
++++ b/alacritty/src/display/damage.rs
+@@ -21,8 +21,8 @@ impl<'a> RenderDamageIterator<'a> {
+     #[inline]
+     fn rect_for_line(&self, line_damage: LineDamageBounds) -> Rect {
+         let size_info = &self.size_info;
+-        let y_top = size_info.height() - size_info.padding_y();
+-        let x = size_info.padding_x() + line_damage.left as u32 * size_info.cell_width();
++        let y_top = size_info.height() - size_info.padding_top();
++        let x = size_info.padding_left() + line_damage.left as u32 * size_info.cell_width();
+         let y = y_top - (line_damage.line + 1) as u32 * size_info.cell_height();
+         let width = (line_damage.right - line_damage.left + 1) as u32 * size_info.cell_width();
+         Rect::new(x as i32, y as i32, width as i32, size_info.cell_height() as i32)
+diff --git a/alacritty/src/display/mod.rs b/alacritty/src/display/mod.rs
+index 1d993af8..286d188d 100644
+--- a/alacritty/src/display/mod.rs
++++ b/alacritty/src/display/mod.rs
+@@ -150,11 +150,17 @@ pub struct SizeInfo<T = f32> {
+     /// Height of individual cell.
+     cell_height: T,
+ 
+-    /// Horizontal window padding.
+-    padding_x: T,
++    /// Top window padding.
++    padding_top: T,
+ 
+-    /// Vertical window padding.
+-    padding_y: T,
++    /// Right window padding.
++    padding_right: T,
++
++    /// Bottom window padding.
++    padding_bottom: T,
++
++    /// Left window padding.
++    padding_left: T,
+ 
+     /// Number of lines in the viewport.
+     screen_lines: usize,
+@@ -170,8 +176,10 @@ impl From<SizeInfo<f32>> for SizeInfo<u32> {
+             height: size_info.height as u32,
+             cell_width: size_info.cell_width as u32,
+             cell_height: size_info.cell_height as u32,
+-            padding_x: size_info.padding_x as u32,
+-            padding_y: size_info.padding_y as u32,
++            padding_top: size_info.padding_top as u32,
++            padding_right: size_info.padding_right as u32,
++            padding_bottom: size_info.padding_bottom as u32,
++            padding_left: size_info.padding_left as u32,
+             screen_lines: size_info.screen_lines,
+             columns: size_info.screen_lines,
+         }
+@@ -211,13 +219,23 @@ impl<T: Clone + Copy> SizeInfo<T> {
+     }
+ 
+     #[inline]
+-    pub fn padding_x(&self) -> T {
+-        self.padding_x
++    pub fn padding_top(&self) -> T {
++        self.padding_top
++    }
++
++    #[inline]
++    pub fn padding_right(&self) -> T {
++        self.padding_right
++    }
++
++    #[inline]
++    pub fn padding_bottom(&self) -> T {
++        self.padding_bottom
+     }
+ 
+     #[inline]
+-    pub fn padding_y(&self) -> T {
+-        self.padding_y
++    pub fn padding_left(&self) -> T {
++        self.padding_left
+     }
+ }
+ 
+@@ -228,19 +246,25 @@ impl SizeInfo<f32> {
+         height: f32,
+         cell_width: f32,
+         cell_height: f32,
+-        mut padding_x: f32,
+-        mut padding_y: f32,
++        mut padding_top: f32,
++        mut padding_right: f32,
++        mut padding_bottom: f32,
++        mut padding_left: f32,
+         dynamic_padding: bool,
+     ) -> SizeInfo {
+         if dynamic_padding {
+-            padding_x = Self::dynamic_padding(padding_x.floor(), width, cell_width);
+-            padding_y = Self::dynamic_padding(padding_y.floor(), height, cell_height);
++            let padding_x = Self::dynamic_padding((padding_left + padding_right).floor(), width, cell_width);
++            let padding_y = Self::dynamic_padding((padding_top + padding_bottom).floor(), height, cell_height);
++            padding_left = padding_x;
++            padding_right = padding_x;
++            padding_top = padding_y;
++            padding_bottom = padding_y;
+         }
+ 
+-        let lines = (height - 2. * padding_y) / cell_height;
++        let lines = (height - padding_top - padding_bottom) / cell_height;
+         let screen_lines = cmp::max(lines as usize, MIN_SCREEN_LINES);
+ 
+-        let columns = (width - 2. * padding_x) / cell_width;
++        let columns = (width - padding_left - padding_right) / cell_width;
+         let columns = cmp::max(columns as usize, MIN_COLUMNS);
+ 
+         SizeInfo {
+@@ -248,8 +272,10 @@ impl SizeInfo<f32> {
+             height,
+             cell_width,
+             cell_height,
+-            padding_x: padding_x.floor(),
+-            padding_y: padding_y.floor(),
++            padding_left: padding_left.floor(),
++            padding_right: padding_right.floor(),
++            padding_top: padding_top.floor(),
++            padding_bottom: padding_bottom.floor(),
+             screen_lines,
+             columns,
+         }
+@@ -265,10 +291,10 @@ impl SizeInfo<f32> {
+     /// The padding, message bar or search are not counted as part of the grid.
+     #[inline]
+     pub fn contains_point(&self, x: usize, y: usize) -> bool {
+-        x <= (self.padding_x + self.columns as f32 * self.cell_width) as usize
+-            && x > self.padding_x as usize
+-            && y <= (self.padding_y + self.screen_lines as f32 * self.cell_height) as usize
+-            && y > self.padding_y as usize
++        x <= (self.padding_left + self.columns as f32 * self.cell_width) as usize
++            && x > self.padding_left as usize
++            && y <= (self.padding_top + self.screen_lines as f32 * self.cell_height) as usize
++            && y > self.padding_top as usize
+     }
+ 
+     /// Calculate padding to spread it evenly around the terminal content.
+@@ -440,11 +466,13 @@ impl Display {
+             cell_height,
+             padding.0,
+             padding.1,
++            padding.2,
++            padding.3,
+             config.window.dynamic_padding && config.window.dimensions().is_none(),
+         );
+ 
+         info!("Cell size: {} x {}", cell_width, cell_height);
+-        info!("Padding: {} x {}", size_info.padding_x(), size_info.padding_y());
++        info!("Padding: {}, {}, {}, {}", size_info.padding_top(), size_info.padding_right(), size_info.padding_bottom(), size_info.padding_left());
+         info!("Width: {}, Height: {}", size_info.width(), size_info.height());
+ 
+         // Update OpenGL projection.
+@@ -638,6 +666,8 @@ impl Display {
+             cell_height,
+             padding.0,
+             padding.1,
++            padding.2,
++            padding.3,
+             config.window.dynamic_padding,
+         );
+ 
+@@ -706,7 +736,7 @@ impl Display {
+             }
+         }
+ 
+-        info!("Padding: {} x {}", self.size_info.padding_x(), self.size_info.padding_y());
++        info!("Padding: {}, {}, {}, {}", self.size_info.padding_top(), self.size_info.padding_right(), self.size_info.padding_bottom(), self.size_info.padding_left());
+         info!("Width: {}, Height: {}", self.size_info.width(), self.size_info.height());
+ 
+         // Damage the entire screen after processing update.
+@@ -934,7 +964,7 @@ impl Display {
+ 
+             // Create a new rectangle for the background.
+             let start_line = size_info.screen_lines() + search_offset;
+-            let y = size_info.cell_height().mul_add(start_line as f32, size_info.padding_y());
++            let y = size_info.cell_height().mul_add(start_line as f32, size_info.padding_top());
+ 
+             let bg = match message.ty() {
+                 MessageType::Error => config.colors.normal.red,
+@@ -1336,8 +1366,8 @@ impl Display {
+     /// This method also enqueues damage for the next frame automatically.
+     fn damage_from_point(&self, point: Point<usize>, len: u32) -> DamageRect {
+         let size_info: SizeInfo<u32> = self.size_info.into();
+-        let x = size_info.padding_x() + point.column.0 as u32 * size_info.cell_width();
+-        let y_top = size_info.height() - size_info.padding_y();
++        let x = size_info.padding_left() + point.column.0 as u32 * size_info.cell_width();
++        let y_top = size_info.height() - size_info.padding_top();
+         let y = y_top - (point.line as u32 + 1) * size_info.cell_height();
+         let width = len * size_info.cell_width();
+         DamageRect::new(x as i32, y as i32, width as i32, size_info.cell_height() as i32)
+diff --git a/alacritty/src/display/window.rs b/alacritty/src/display/window.rs
+index f5128e75..8807dfd8 100644
+--- a/alacritty/src/display/window.rs
++++ b/alacritty/src/display/window.rs
+@@ -414,8 +414,8 @@ impl Window {
+ 
+     /// Adjust the IME editor position according to the new location of the cursor.
+     pub fn update_ime_position(&self, point: Point<usize>, size: &SizeInfo) {
+-        let nspot_x = f64::from(size.padding_x() + point.column.0 as f32 * size.cell_width());
+-        let nspot_y = f64::from(size.padding_y() + (point.line + 1) as f32 * size.cell_height());
++        let nspot_x = f64::from(size.padding_left() + point.column.0 as f32 * size.cell_width());
++        let nspot_y = f64::from(size.padding_top() + (point.line + 1) as f32 * size.cell_height());
+ 
+         // Exclude the rest of the line since we edit from left to right.
+         let width = size.width as f64 - nspot_x;
+diff --git a/alacritty/src/event.rs b/alacritty/src/event.rs
+index 3dc1a262..209a0acf 100644
+--- a/alacritty/src/event.rs
++++ b/alacritty/src/event.rs
+@@ -1230,10 +1230,10 @@ impl Mouse {
+     /// coordinates will be clamped to the closest grid coordinates.
+     #[inline]
+     pub fn point(&self, size: &SizeInfo, display_offset: usize) -> Point {
+-        let col = self.x.saturating_sub(size.padding_x() as usize) / (size.cell_width() as usize);
++        let col = self.x.saturating_sub(size.padding_left() as usize) / (size.cell_width() as usize);
+         let col = min(Column(col), size.last_column());
+ 
+-        let line = self.y.saturating_sub(size.padding_y() as usize) / (size.cell_height() as usize);
++        let line = self.y.saturating_sub(size.padding_top() as usize) / (size.cell_height() as usize);
+         let line = min(line, size.bottommost_line().0 as usize);
+ 
+         term::viewport_to_point(display_offset, Point::new(line, col))
+diff --git a/alacritty/src/input.rs b/alacritty/src/input.rs
+index 3c11c435..325e5e4a 100644
+--- a/alacritty/src/input.rs
++++ b/alacritty/src/input.rs
+@@ -500,12 +500,12 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+         let size_info = self.ctx.size_info();
+ 
+         let cell_x =
+-            x.saturating_sub(size_info.padding_x() as usize) % size_info.cell_width() as usize;
++            x.saturating_sub(size_info.padding_left() as usize) % size_info.cell_width() as usize;
+         let half_cell_width = (size_info.cell_width() / 2.0) as usize;
+ 
+         let additional_padding =
+-            (size_info.width() - size_info.padding_x() * 2.) % size_info.cell_width();
+-        let end_of_grid = size_info.width() - size_info.padding_x() - additional_padding;
++            (size_info.width() - size_info.padding_right() - size_info.padding_left()) % size_info.cell_width();
++        let end_of_grid = size_info.width() - size_info.padding_right() - additional_padding;
+ 
+         if cell_x > half_cell_width
+             // Edge case when mouse leaves the window.
+@@ -1158,7 +1158,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+ 
+         // Calculate Y position of the end of the last terminal line.
+         let size = self.ctx.size_info();
+-        let terminal_end = size.padding_y() as usize
++        let terminal_end = size.padding_top() as usize
+             + size.cell_height() as usize * (size.screen_lines() + search_height);
+ 
+         let mouse = self.ctx.mouse();
+@@ -1208,8 +1208,8 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+         let step = (SELECTION_SCROLLING_STEP * scale_factor) as i32;
+ 
+         // Compute the height of the scrolling areas.
+-        let end_top = max(min_height, size.padding_y() as i32);
+-        let text_area_bottom = size.padding_y() + size.screen_lines() as f32 * size.cell_height();
++        let end_top = max(min_height, size.padding_top() as i32);
++        let text_area_bottom = size.padding_top() + size.screen_lines() as f32 * size.cell_height();
+         let start_bottom = min(size.height() as i32 - min_height, text_area_bottom as i32);
+ 
+         // Get distance from closest window boundary.
+@@ -1379,6 +1379,8 @@ mod tests {
+                     3.0,
+                     0.,
+                     0.,
++                    0.,
++                    0.,
+                     false,
+                 );
+ 
+diff --git a/alacritty/src/message_bar.rs b/alacritty/src/message_bar.rs
+index 267f8322..d4d9e699 100644
+--- a/alacritty/src/message_bar.rs
++++ b/alacritty/src/message_bar.rs
+@@ -39,7 +39,7 @@ impl Message {
+     pub fn text(&self, size_info: &SizeInfo) -> Vec<String> {
+         let num_cols = size_info.columns();
+         let total_lines =
+-            (size_info.height() - 2. * size_info.padding_y()) / size_info.cell_height();
++            (size_info.height() - size_info.padding_top() - size_info.padding_bottom()) / size_info.cell_height();
+         let max_lines = (total_lines as usize).saturating_sub(MIN_FREE_LINES);
+         let button_len = CLOSE_BUTTON_TEXT.chars().count();
+ 
+@@ -200,7 +200,7 @@ mod tests {
+         let input = "a";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(7., 10., 1., 1., 0., 0., false);
++        let size = SizeInfo::new(7., 10., 1., 1., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+@@ -212,7 +212,7 @@ mod tests {
+         let input = "fo\nbar";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(6., 10., 1., 1., 0., 0., false);
++        let size = SizeInfo::new(6., 10., 1., 1., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+@@ -224,7 +224,7 @@ mod tests {
+         let input = "a\nb";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(6., 10., 1., 1., 0., 0., false);
++        let size = SizeInfo::new(6., 10., 1., 1., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+@@ -236,7 +236,7 @@ mod tests {
+         let input = "foobar1";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(6., 10., 1., 1., 0., 0., false);
++        let size = SizeInfo::new(6., 10., 1., 1., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+@@ -248,7 +248,7 @@ mod tests {
+         let input = "foobar";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(6., 0., 1., 1., 0., 0., false);
++        let size = SizeInfo::new(6., 0., 1., 1., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+@@ -260,7 +260,7 @@ mod tests {
+         let input = "hahahahahahahahahahaha truncate this because it's too long for the term";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(22., (MIN_FREE_LINES + 2) as f32, 1., 1., 0., 0., false);
++        let size = SizeInfo::new(22., (MIN_FREE_LINES + 2) as f32, 1., 1., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+@@ -275,7 +275,7 @@ mod tests {
+         let input = "ha";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(2., 10., 1., 1., 0., 0., false);
++        let size = SizeInfo::new(2., 10., 1., 1., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+@@ -287,7 +287,7 @@ mod tests {
+         let input = "hahahahahahahahaha";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(2., (MIN_FREE_LINES + 2) as f32, 1., 1., 0., 0., false);
++        let size = SizeInfo::new(2., (MIN_FREE_LINES + 2) as f32, 1., 1., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+@@ -299,7 +299,7 @@ mod tests {
+         let input = "test";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(5., 10., 1., 1., 0., 0., false);
++        let size = SizeInfo::new(5., 10., 1., 1., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+@@ -349,7 +349,7 @@ mod tests {
+         let input = "a\nbc defg";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(5., 10., 1., 1., 0., 0., false);
++        let size = SizeInfo::new(5., 10., 1., 1., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+@@ -365,7 +365,7 @@ mod tests {
+         let input = "ab\nc 👩d fgh";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(7., 10., 1., 1., 0., 0., false);
++        let size = SizeInfo::new(7., 10., 1., 1., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+@@ -381,7 +381,7 @@ mod tests {
+         let input = "\n0 1 2 3";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(3., 10., 1., 1., 0., 0., false);
++        let size = SizeInfo::new(3., 10., 1., 1., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+diff --git a/alacritty/src/renderer/mod.rs b/alacritty/src/renderer/mod.rs
+index df3ca0b7..8eea426d 100644
+--- a/alacritty/src/renderer/mod.rs
++++ b/alacritty/src/renderer/mod.rs
+@@ -265,10 +265,10 @@ impl Renderer {
+     pub fn set_viewport(&self, size: &SizeInfo) {
+         unsafe {
+             gl::Viewport(
+-                size.padding_x() as i32,
+-                size.padding_y() as i32,
+-                size.width() as i32 - 2 * size.padding_x() as i32,
+-                size.height() as i32 - 2 * size.padding_y() as i32,
++                size.padding_left() as i32,
++                size.padding_bottom() as i32,
++                size.width() as i32 - (size.padding_left() + size.padding_right()) as i32,
++                size.height() as i32 - (size.padding_top() + size.padding_bottom()) as i32,
+             );
+         }
+     }
+diff --git a/alacritty/src/renderer/rects.rs b/alacritty/src/renderer/rects.rs
+index 3b0b8695..e10adf31 100644
+--- a/alacritty/src/renderer/rects.rs
++++ b/alacritty/src/renderer/rects.rs
+@@ -145,8 +145,8 @@ impl RenderLine {
+         }
+ 
+         RenderRect::new(
+-            start_x + size.padding_x(),
+-            y + size.padding_y(),
++            start_x + size.padding_left(),
++            y + size.padding_top(),
+             width,
+             thickness,
+             color,
+@@ -456,7 +456,7 @@ impl RectShaderProgram {
+         let position = (0.5 * metrics.descent).abs();
+         let underline_position = metrics.descent.abs() - metrics.underline_position.abs();
+ 
+-        let viewport_height = size_info.height() - size_info.padding_y();
++        let viewport_height = size_info.height() - size_info.padding_bottom();
+         let padding_y = viewport_height
+             - (viewport_height / size_info.cell_height()).floor() * size_info.cell_height();
+ 
+@@ -471,7 +471,8 @@ impl RectShaderProgram {
+                 gl::Uniform1f(u_padding_y, padding_y);
+             }
+             if let Some(u_padding_x) = self.u_padding_x {
+-                gl::Uniform1f(u_padding_x, size_info.padding_x());
++                // FIXME update shaders to padding_left and padding_right
++                gl::Uniform1f(u_padding_x, size_info.padding_left());
+             }
+             if let Some(u_underline_position) = self.u_underline_position {
+                 gl::Uniform1f(u_underline_position, underline_position);
+diff --git a/alacritty/src/renderer/text/mod.rs b/alacritty/src/renderer/text/mod.rs
+index 886b7f8b..6312ddd0 100644
+--- a/alacritty/src/renderer/text/mod.rs
++++ b/alacritty/src/renderer/text/mod.rs
+@@ -199,19 +199,19 @@ impl<'a> LoadGlyph for LoaderApi<'a> {
+ fn update_projection(u_projection: GLint, size: &SizeInfo) {
+     let width = size.width();
+     let height = size.height();
+-    let padding_x = size.padding_x();
+-    let padding_y = size.padding_y();
++    let padding_x = size.padding_left() + size.padding_right();
++    let padding_y = size.padding_top() + size.padding_bottom();
+ 
+     // Bounds check.
+-    if (width as u32) < (2 * padding_x as u32) || (height as u32) < (2 * padding_y as u32) {
++    if (width as u32) < (padding_x as u32) || (height as u32) < (padding_y as u32) {
+         return;
+     }
+ 
+     // Compute scale and offset factors, from pixel to ndc space. Y is inverted.
+     //   [0, width - 2 * padding_x] to [-1, 1]
+     //   [height - 2 * padding_y, 0] to [-1, 1]
+-    let scale_x = 2. / (width - 2. * padding_x);
+-    let scale_y = -2. / (height - 2. * padding_y);
++    let scale_x = 2. / (width - padding_x);
++    let scale_y = -2. / (height - padding_y);
+     let offset_x = -1.;
+     let offset_y = 1.;
+ 
+-- 
+2.41.0
+

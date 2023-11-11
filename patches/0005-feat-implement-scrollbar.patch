@@ -1,0 +1,1076 @@
+From 09db0c011a2a2892b0cff192d02c7f28a1280e3c Mon Sep 17 00:00:00 2001
+From: Lars Frost <freezinglava@proton.me>
+Date: Mon, 11 Sep 2023 17:03:35 +0200
+Subject: [PATCH 5/5] feat: implement scrollbar
+
+---
+ CHANGELOG.md                        |   1 +
+ alacritty/src/config/ui_config.rs   |  48 ++++++
+ alacritty/src/display/damage.rs     |   1 +
+ alacritty/src/display/mod.rs        |  91 +++++++++-
+ alacritty/src/display/scrollbar.rs  | 252 ++++++++++++++++++++++++++++
+ alacritty/src/event.rs              |  25 ++-
+ alacritty/src/input.rs              |  86 +++++++++-
+ alacritty/src/message_bar.rs        |  24 +--
+ alacritty/src/renderer/rects.rs     |   1 -
+ alacritty/src/scheduler.rs          |   1 +
+ alacritty_terminal/src/selection.rs |   3 +
+ extra/man/alacritty.5.scd           |  38 +++++
+ 12 files changed, 540 insertions(+), 31 deletions(-)
+ create mode 100644 alacritty/src/display/scrollbar.rs
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 51588864..b9366e85 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+ 
+ ### Added
+ 
++- Scrollbar (enable via config `scrollbar.mode`)
+ - Warnings for unused configuration file options
+ - Config option `persist` in `hints` config section
+ - Support for dynamically loading conpty.dll on Windows
+diff --git a/alacritty/src/config/ui_config.rs b/alacritty/src/config/ui_config.rs
+index b848081e..2c437bc9 100644
+--- a/alacritty/src/config/ui_config.rs
++++ b/alacritty/src/config/ui_config.rs
+@@ -13,6 +13,10 @@ use unicode_width::UnicodeWidthChar;
+ use winit::keyboard::{Key, KeyLocation, ModifiersState};
+ 
+ use alacritty_config_derive::{ConfigDeserialize, SerdeReplace};
++use alacritty_terminal::config::{
++    Config as TerminalConfig, Percentage, Program, LOG_TARGET_CONFIG,
++};
++use alacritty_terminal::term::color::Rgb;
+ use alacritty_terminal::term::search::RegexSearch;
+ 
+ use crate::config::bell::BellConfig;
+@@ -98,6 +102,8 @@ pub struct UiConfig {
+     /// Keyboard configuration.
+     keyboard: Keyboard,
+ 
++    pub scrollbar: Scrollbar,
++
+     /// Should draw bold text with brighter colors instead of bold font.
+     #[config(deprecated = "use colors.draw_bold_text_with_bright_colors instead")]
+     draw_bold_text_with_bright_colors: bool,
+@@ -132,7 +138,11 @@ impl Default for UiConfig {
+             scrolling: Default::default(),
+             selection: Default::default(),
+             keyboard: Default::default(),
++<<<<<<< HEAD
+             terminal: Default::default(),
++=======
++            scrollbar: Default::default(),
++>>>>>>> 3e532ce4 (Add non-interactive scrollbar)
+             import: Default::default(),
+             cursor: Default::default(),
+             window: Default::default(),
+@@ -281,6 +291,44 @@ where
+     Ok(bindings)
+ }
+ 
++#[derive(ConfigDeserialize, Clone, Debug, PartialEq)]
++pub struct Scrollbar {
++    pub mode: ScrollbarMode,
++    pub color: Rgb,
++    /// Scrollbar opacity from 0.0 (invisible) to 1.0 (opaque).
++    pub opacity: Percentage,
++    /// Time (in seconds) the scrollbar fading takes.
++    pub fade_time_in_secs: f32,
++}
++impl Scrollbar {
++    pub fn additional_padding(&self, cell_width: f32, window_padding_x: f32) -> f32 {
++        if self.mode == ScrollbarMode::Always {
++            window_padding_x + cell_width
++        } else {
++            0.0
++        }
++    }
++}
++
++impl Default for Scrollbar {
++    fn default() -> Self {
++        Scrollbar {
++            mode: Default::default(),
++            color: Rgb::new(0x7f, 0x7f, 0x7f),
++            opacity: Percentage::new(0.5),
++            fade_time_in_secs: 2.0,
++        }
++    }
++}
++
++#[derive(ConfigDeserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum ScrollbarMode {
++    #[default]
++    Never,
++    Fading,
++    Always,
++}
++
+ /// A delta for a point in a 2 dimensional plane.
+ #[derive(ConfigDeserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+ pub struct Delta<T: Default> {
+diff --git a/alacritty/src/display/damage.rs b/alacritty/src/display/damage.rs
+index 8e1ee8b9..e296d486 100644
+--- a/alacritty/src/display/damage.rs
++++ b/alacritty/src/display/damage.rs
+@@ -110,6 +110,7 @@ mod tests {
+             cell_size as f32,
+             2.,
+             2.,
++            0.,
+             true,
+         )
+         .into();
+diff --git a/alacritty/src/display/mod.rs b/alacritty/src/display/mod.rs
+index 286d188d..3b2544f6 100644
+--- a/alacritty/src/display/mod.rs
++++ b/alacritty/src/display/mod.rs
+@@ -33,6 +33,7 @@ use alacritty_terminal::vte::ansi::{CursorShape, NamedColor};
+ 
+ use crate::config::font::Font;
+ use crate::config::scrolling::MAX_SCROLLBACK_LINES;
++use crate::config::ui_config::{Scrollbar as ScrollbarConfig, ScrollbarMode};
+ use crate::config::window::Dimensions;
+ #[cfg(not(windows))]
+ use crate::config::window::StartupMode;
+@@ -44,6 +45,7 @@ use crate::display::cursor::IntoRects;
+ use crate::display::damage::RenderDamageIterator;
+ use crate::display::hint::{HintMatch, HintState};
+ use crate::display::meter::Meter;
++use crate::display::scrollbar::Scrollbar;
+ use crate::display::window::Window;
+ use crate::event::{Event, EventType, Mouse, SearchState};
+ use crate::message_bar::{MessageBuffer, MessageType};
+@@ -61,6 +63,7 @@ pub mod window;
+ mod bell;
+ mod damage;
+ mod meter;
++mod scrollbar;
+ 
+ /// Label for the forward terminal search bar.
+ const FORWARD_SEARCH_LABEL: &str = "Search: ";
+@@ -250,10 +253,15 @@ impl SizeInfo<f32> {
+         mut padding_right: f32,
+         mut padding_bottom: f32,
+         mut padding_left: f32,
++        scrollbar_width: f32,
+         dynamic_padding: bool,
+     ) -> SizeInfo {
+         if dynamic_padding {
+-            let padding_x = Self::dynamic_padding((padding_left + padding_right).floor(), width, cell_width);
++            let padding_x = Self::dynamic_padding(
++                (padding_left + padding_right + scrollbar_width).floor(),
++                width,
++                cell_width
++            );
+             let padding_y = Self::dynamic_padding((padding_top + padding_bottom).floor(), height, cell_height);
+             padding_left = padding_x;
+             padding_right = padding_x;
+@@ -264,7 +272,7 @@ impl SizeInfo<f32> {
+         let lines = (height - padding_top - padding_bottom) / cell_height;
+         let screen_lines = cmp::max(lines as usize, MIN_SCREEN_LINES);
+ 
+-        let columns = (width - padding_left - padding_right) / cell_width;
++        let columns = (width - padding_left - padding_right - scrollbar_width) / cell_width;
+         let columns = cmp::max(columns as usize, MIN_COLUMNS);
+ 
+         SizeInfo {
+@@ -300,7 +308,7 @@ impl SizeInfo<f32> {
+     /// Calculate padding to spread it evenly around the terminal content.
+     #[inline]
+     fn dynamic_padding(padding: f32, dimension: f32, cell_dimension: f32) -> f32 {
+-        padding + ((dimension - 2. * padding) % cell_dimension) / 2.
++        padding + ((dimension - padding) % cell_dimension) / 2.
+     }
+ }
+ 
+@@ -378,6 +386,8 @@ pub struct Display {
+ 
+     pub visual_bell: VisualBell,
+ 
++    pub scrollbar: Scrollbar,
++
+     /// Mapped RGB values for each terminal color.
+     pub colors: List,
+ 
+@@ -468,6 +478,7 @@ impl Display {
+             padding.1,
+             padding.2,
+             padding.3,
++            config.scrollbar.additional_padding(cell_width, padding.1),
+             config.window.dynamic_padding && config.window.dimensions().is_none(),
+         );
+ 
+@@ -543,6 +554,7 @@ impl Display {
+             cursor_hidden: false,
+             frame_timer: FrameTimer::new(),
+             visual_bell: VisualBell::from(&config.bell),
++            scrollbar: Scrollbar::from(&config.scrollbar),
+             colors: List::from(&config.colors),
+             pending_update: Default::default(),
+             pending_renderer_update: Default::default(),
+@@ -668,6 +680,7 @@ impl Display {
+             padding.1,
+             padding.2,
+             padding.3,
++            config.scrollbar.additional_padding(cell_width, padding.1),
+             config.window.dynamic_padding,
+         );
+ 
+@@ -954,6 +967,16 @@ impl Display {
+             }
+         }
+ 
++        if config.scrollbar.mode != ScrollbarMode::Never {
++            self.draw_scrollbar(
++                &mut rects,
++                scheduler,
++                display_offset,
++                total_lines,
++                &config.scrollbar,
++            );
++        }
++
+         if self.debug_damage {
+             self.highlight_damage(&mut rects);
+         }
+@@ -1036,6 +1059,7 @@ impl Display {
+     pub fn update_config(&mut self, config: &UiConfig) {
+         self.debug_damage = config.debug.highlight_damage;
+         self.visual_bell.update_config(&config.bell);
++        self.scrollbar.update_config(&config.scrollbar);
+         self.colors = List::from(&config.colors);
+     }
+ 
+@@ -1093,6 +1117,53 @@ impl Display {
+         dirty
+     }
+ 
++    fn draw_scrollbar(
++        &mut self,
++        rects: &mut Vec<RenderRect>,
++        scheduler: &mut Scheduler,
++        display_offset: usize,
++        total_lines: usize,
++        config: &ScrollbarConfig,
++    ) {
++        let did_position_change = self.scrollbar.update(display_offset, total_lines);
++        let opacity = match self.scrollbar.intensity(self.size_info) {
++            scrollbar::ScrollbarState::Show { opacity } => opacity,
++            scrollbar::ScrollbarState::WaitForFading { opacity, remaining_duration } => {
++                self.request_scrollbar_redraw(scheduler, remaining_duration);
++                opacity
++            },
++            scrollbar::ScrollbarState::Fading { opacity } => {
++                self.window.request_redraw();
++                opacity
++            },
++            scrollbar::ScrollbarState::Invisible { has_damage } => {
++                if !has_damage {
++                    return;
++                }
++                0.
++            },
++        };
++        let bg_rect = self.scrollbar.bg_rect(self.size_info);
++        let scrollbar_rect = self.scrollbar.rect_from_bg_rect(bg_rect, self.size_info);
++        let y = self.size_info.height - (scrollbar_rect.y + scrollbar_rect.height) as f32;
++        if opacity != 0. {
++            rects.push(RenderRect::new(
++                scrollbar_rect.x as f32,
++                y,
++                scrollbar_rect.width as f32,
++                scrollbar_rect.height as f32,
++                config.color,
++                opacity,
++            ));
++        }
++
++        if did_position_change {
++            self.damage_rects.push(bg_rect);
++        } else if config.mode == ScrollbarMode::Fading && opacity < config.opacity.as_f32() {
++            self.damage_rects.push(scrollbar_rect);
++        }
++    }
++
+     #[inline(never)]
+     fn draw_ime_preview(
+         &mut self,
+@@ -1432,10 +1503,19 @@ impl Display {
+ 
+         let window_id = self.window.id();
+         let timer_id = TimerId::new(Topic::Frame, window_id);
+-        let event = Event::new(EventType::Frame, window_id);
++        let event = Event::new(EventType::Frame { force: false }, window_id);
+ 
+         scheduler.schedule(event, swap_timeout, false, timer_id);
+     }
++
++    fn request_scrollbar_redraw(&mut self, scheduler: &mut Scheduler, wait_timeout: Duration) {
++        let window_id = self.window.id();
++        let timer_id = TimerId::new(Topic::ScrollbarRedraw, window_id);
++        let event = Event::new(EventType::Frame { force: true }, window_id);
++
++        scheduler.unschedule(timer_id);
++        scheduler.schedule(event, wait_timeout, false, timer_id);
++    }
+ }
+ 
+ impl Drop for Display {
+@@ -1650,7 +1730,8 @@ fn window_size(
+     let grid_width = cell_width * dimensions.columns.max(MIN_COLUMNS) as f32;
+     let grid_height = cell_height * dimensions.lines.max(MIN_SCREEN_LINES) as f32;
+ 
+-    let width = (padding.0).mul_add(2., grid_width).floor();
++    let width = (padding.0).mul_add(2., grid_width).floor()
++        + config.scrollbar.additional_padding(cell_width, padding.0);
+     let height = (padding.1).mul_add(2., grid_height).floor();
+ 
+     PhysicalSize::new(width as u32, height as u32)
+diff --git a/alacritty/src/display/scrollbar.rs b/alacritty/src/display/scrollbar.rs
+new file mode 100644
+index 00000000..4576576f
+--- /dev/null
++++ b/alacritty/src/display/scrollbar.rs
+@@ -0,0 +1,252 @@
++use std::time::{Duration, Instant};
++
++use alacritty_terminal::grid::Scroll;
++use glutin::surface::Rect;
++
++use crate::config::ui_config::{Scrollbar as ScrollbarConfig, ScrollbarMode};
++
++use super::SizeInfo;
++
++/// Keeps track of when the scrollbar should be visible or fading.
++#[derive(Debug, Clone, PartialEq)]
++pub struct Scrollbar {
++    config: ScrollbarConfig,
++    /// Display offset, that was last used to draw the scrollbar.
++    display_offset: usize,
++    /// Total lines, that was last used to draw the scrollbar.
++    total_lines: usize,
++    last_change: Option<Instant>,
++    drag_state: Option<DragState>,
++}
++
++impl From<&ScrollbarConfig> for Scrollbar {
++    fn from(value: &ScrollbarConfig) -> Self {
++        Scrollbar {
++            config: value.clone(),
++            display_offset: 0,
++            total_lines: 0,
++            last_change: None,
++            drag_state: None,
++        }
++    }
++}
++
++#[derive(Debug, Copy, Clone, PartialEq)]
++pub enum ScrollbarState {
++    Show {
++        opacity: f32,
++    },
++    WaitForFading {
++        opacity: f32,
++        remaining_duration: Duration,
++    },
++    Fading {
++        opacity: f32,
++    },
++    /// `has_damage` - If the scrollbar was previously viisible, we need to draw a damage rect.
++    Invisible {
++        has_damage: bool,
++    },
++}
++
++impl Scrollbar {
++    pub fn update_config(&mut self, config: &ScrollbarConfig) {
++        self.config = config.clone();
++    }
++
++    /// Returns whether the scrollbar position or height needs an update.
++    pub fn update(&mut self, display_offset: usize, total_lines: usize) -> bool {
++        if self.display_offset != display_offset {
++            self.display_offset = display_offset;
++            self.total_lines = total_lines;
++            self.last_change = Some(Instant::now());
++            true
++        } else if self.total_lines != total_lines {
++            self.total_lines = total_lines;
++            self.last_change = Some(Instant::now());
++            true
++        } else {
++            false
++        }
++    }
++
++    fn last_change_time(&self) -> Option<Instant> {
++        self.last_change
++    }
++
++    fn clear_change_time(&mut self) {
++        self.last_change = None;
++    }
++
++    pub fn is_visible(&self, display_size: SizeInfo) -> bool {
++        match self.config.mode {
++            ScrollbarMode::Never => false,
++            ScrollbarMode::Fading => {
++                self.is_dragging()
++                    || self.total_lines > display_size.screen_lines
++                        && self.last_change_time().is_some()
++            },
++            ScrollbarMode::Always => true,
++        }
++    }
++
++    pub fn intensity(&mut self, display_size: SizeInfo) -> ScrollbarState {
++        match self.config.mode {
++            ScrollbarMode::Never => ScrollbarState::Invisible { has_damage: false },
++            ScrollbarMode::Fading => {
++                if self.total_lines <= display_size.screen_lines {
++                    return ScrollbarState::Invisible { has_damage: false };
++                }
++                if self.is_dragging() {
++                    self.last_change = Some(Instant::now());
++                }
++                if let Some(last_scroll) = self.last_change_time() {
++                    let timeout = (Instant::now() - last_scroll).as_secs_f32();
++                    let fade_wait = self.config.fade_time_in_secs * 0.8;
++                    let fade_time = self.config.fade_time_in_secs - fade_wait;
++                    if timeout <= fade_wait {
++                        let opacity = self.config.opacity.as_f32();
++                        let remaining_duration = Duration::from_secs_f32(fade_wait - timeout);
++                        ScrollbarState::WaitForFading { opacity, remaining_duration }
++                    } else {
++                        let current_fade_time = timeout - fade_wait;
++                        if current_fade_time < fade_time {
++                            // Fading progress from 0.0 to 1.0.
++                            let fading_progress = current_fade_time / fade_time;
++                            let opacity = (1.0 - fading_progress) * self.config.opacity.as_f32();
++                            ScrollbarState::Fading { opacity }
++                        } else {
++                            self.clear_change_time();
++                            ScrollbarState::Invisible { has_damage: true }
++                        }
++                    }
++                } else {
++                    ScrollbarState::Invisible { has_damage: false }
++                }
++            },
++            ScrollbarMode::Always => ScrollbarState::Show { opacity: self.config.opacity.as_f32() },
++        }
++    }
++
++    pub fn bg_rect(&self, display_size: SizeInfo) -> Rect {
++        let scrollbar_margin_y = display_size.padding_y();
++        let scrollbar_margin_x = display_size.padding_right()
++            - self.config.additional_padding(display_size.cell_width, display_size.padding_left());
++
++        let background_area_height: f32 = display_size.height - 2. * scrollbar_margin_y;
++
++        let scrollbar_width = display_size.cell_width;
++        let x = display_size.width - scrollbar_width - scrollbar_margin_x;
++        Rect {
++            x: x.floor() as i32,
++            y: scrollbar_margin_y.floor() as i32,
++            width: scrollbar_width.ceil() as i32,
++            height: background_area_height.ceil() as i32,
++        }
++    }
++
++    pub fn rect_from_bg_rect(&self, bg_rect: Rect, display_size: SizeInfo) -> Rect {
++        let height_fraction = display_size.screen_lines as f32 / self.total_lines as f32;
++        let scrollbar_height =
++            (height_fraction * bg_rect.height as f32).max(2. * display_size.cell_height);
++
++        let y_progress = if self.total_lines <= display_size.screen_lines {
++            0.0
++        } else {
++            self.display_offset as f32 / (self.total_lines - display_size.screen_lines) as f32
++        };
++        let y = y_progress * (bg_rect.height as f32 - scrollbar_height) + bg_rect.y as f32;
++
++        Rect {
++            x: bg_rect.x,
++            y: y.floor() as i32,
++            width: bg_rect.width,
++            height: scrollbar_height.ceil() as i32,
++        }
++    }
++
++    pub fn contains_mouse_pos(
++        &mut self,
++        display_size: SizeInfo,
++        mouse_x: usize,
++        mouse_y: usize,
++    ) -> bool {
++        if !self.is_visible(display_size) {
++            return false;
++        }
++
++        let bg_rect = self.bg_rect(display_size);
++        let scrollbar_rect = self.rect_from_bg_rect(bg_rect, display_size);
++        let mouse_x = mouse_x as f32;
++        let mouse_y = display_size.height - mouse_y as f32;
++
++        if !(scrollbar_rect.x as f32..(scrollbar_rect.x + scrollbar_rect.width) as f32)
++            .contains(&mouse_x)
++        {
++            return false;
++        }
++
++        (scrollbar_rect.y as f32..(scrollbar_rect.y + scrollbar_rect.height) as f32)
++            .contains(&mouse_y)
++    }
++
++    pub fn try_start_drag(
++        &mut self,
++        display_size: SizeInfo,
++        mouse_x: usize,
++        mouse_y: usize,
++    ) -> bool {
++        if !self.contains_mouse_pos(display_size, mouse_x, mouse_y) {
++            return false;
++        }
++
++        let bg_rect = self.bg_rect(display_size);
++        let rect = self.rect_from_bg_rect(bg_rect, display_size);
++
++        if bg_rect.height == rect.height || self.total_lines <= display_size.screen_lines {
++            self.drag_state =
++                Some(DragState { cells_per_dragged_pixel: 0.0, accumulated_cells: 0. });
++            return true;
++        }
++
++        // Amount of pixels, you have to drag over, to scroll from top to bottom.
++        let total_pixel_scroll = bg_rect.height - rect.height;
++        let total_lines_to_scroll = self.total_lines - display_size.screen_lines;
++        let cells_per_dragged_pixel = total_lines_to_scroll as f32 / total_pixel_scroll as f32;
++        self.drag_state = Some(DragState { cells_per_dragged_pixel, accumulated_cells: 0. });
++
++        true
++    }
++
++    pub fn is_dragging(&self) -> bool {
++        self.drag_state.is_some()
++    }
++
++    pub fn stop_dragging(&mut self) {
++        self.drag_state = None;
++    }
++
++    #[must_use = "The actual scroll is not applied but returned and has to be applied by the \
++                  callside"]
++    pub fn apply_mouse_delta(&mut self, mouse_y_delta_in_pixel: f32) -> Option<Scroll> {
++        if let Some(drag_state) = self.drag_state.as_mut() {
++            drag_state.accumulated_cells +=
++                mouse_y_delta_in_pixel * drag_state.cells_per_dragged_pixel;
++            let cells = drag_state.accumulated_cells as i32; // round towards zero
++            if cells == 0 {
++                None
++            } else {
++                drag_state.accumulated_cells -= cells as f32;
++                Some(Scroll::Delta(-cells))
++            }
++        } else {
++            None
++        }
++    }
++}
++
++#[derive(Debug, Copy, Clone, PartialEq)]
++struct DragState {
++    cells_per_dragged_pixel: f32,
++    accumulated_cells: f32,
++}
+diff --git a/alacritty/src/event.rs b/alacritty/src/event.rs
+index 209a0acf..e13bde85 100644
+--- a/alacritty/src/event.rs
++++ b/alacritty/src/event.rs
+@@ -101,7 +101,9 @@ pub enum EventType {
+     BlinkCursor,
+     BlinkCursorTimeout,
+     SearchNext,
+-    Frame,
++    Frame {
++        force: bool,
++    },
+ }
+ 
+ impl From<TerminalEvent> for EventType {
+@@ -302,12 +304,23 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
+         *self.dirty |= selection.map_or(false, |s| !s.is_empty());
+     }
+ 
++    fn stop_selection(&mut self) {
++        if let Some(selection) = self.terminal.selection.as_mut() {
++            selection.active = false;
++        };
++    }
++
+     fn update_selection(&mut self, mut point: Point, side: Side) {
+         let mut selection = match self.terminal.selection.take() {
+             Some(selection) => selection,
+             None => return,
+         };
+ 
++        if !selection.active {
++            self.terminal.selection = Some(selection);
++            return;
++        }
++
+         // Treat motion over message bar like motion over the last line.
+         point.line = min(point.line, self.terminal.bottommost_line());
+ 
+@@ -1125,6 +1138,7 @@ pub enum TouchPurpose {
+     None,
+     Select(TouchEvent),
+     Scroll(TouchEvent),
++    ScrollbarDrag(TouchEvent),
+     Zoom(TouchZoom),
+     Tap(TouchEvent),
+     Invalid(HashSet<u64, RandomState>),
+@@ -1230,7 +1244,8 @@ impl Mouse {
+     /// coordinates will be clamped to the closest grid coordinates.
+     #[inline]
+     pub fn point(&self, size: &SizeInfo, display_offset: usize) -> Point {
+-        let col = self.x.saturating_sub(size.padding_left() as usize) / (size.cell_width() as usize);
++        let col =
++            self.x.saturating_sub(size.padding_left() as usize) / (size.cell_width() as usize);
+         let col = min(Column(col), size.last_column());
+ 
+         let line = self.y.saturating_sub(size.padding_top() as usize) / (size.cell_height() as usize);
+@@ -1344,7 +1359,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
+                 EventType::Message(_)
+                 | EventType::ConfigReload(_)
+                 | EventType::CreateWindow(_)
+-                | EventType::Frame => (),
++                | EventType::Frame { .. } => (),
+             },
+             WinitEvent::WindowEvent { event, .. } => {
+                 match event {
+@@ -1632,11 +1647,11 @@ impl Processor {
+                 // NOTE: This event bypasses batching to minimize input latency.
+                 WinitEvent::UserEvent(Event {
+                     window_id: Some(window_id),
+-                    payload: EventType::Frame,
++                    payload: EventType::Frame { force },
+                 }) => {
+                     if let Some(window_context) = self.windows.get_mut(&window_id) {
+                         window_context.display.window.has_frame = true;
+-                        if window_context.dirty {
++                        if window_context.dirty || force {
+                             window_context.display.window.request_redraw();
+                         }
+                     }
+diff --git a/alacritty/src/input.rs b/alacritty/src/input.rs
+index 325e5e4a..86e2b452 100644
+--- a/alacritty/src/input.rs
++++ b/alacritty/src/input.rs
+@@ -39,6 +39,7 @@ use alacritty_terminal::vi_mode::ViMotion;
+ use alacritty_terminal::vte::ansi::{ClearMode, Handler};
+ 
+ use crate::clipboard::Clipboard;
++use crate::config::ui_config::ScrollbarMode;
+ use crate::config::{
+     Action, BindingKey, BindingMode, MouseAction, SearchAction, UiConfig, ViAction,
+ };
+@@ -88,6 +89,7 @@ pub trait ActionContext<T: EventListener> {
+     fn toggle_selection(&mut self, _ty: SelectionType, _point: Point, _side: Side) {}
+     fn update_selection(&mut self, _point: Point, _side: Side) {}
+     fn clear_selection(&mut self) {}
++    fn stop_selection(&mut self) {}
+     fn selection_is_empty(&self) -> bool;
+     fn mouse_mut(&mut self) -> &mut Mouse;
+     fn mouse(&self) -> &Mouse;
+@@ -446,6 +448,15 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+ 
+         let x = x.clamp(0, size_info.width() as i32 - 1) as usize;
+         let y = y.clamp(0, size_info.height() as i32 - 1) as usize;
++
++        if self.ctx.config().scrollbar.mode != ScrollbarMode::Never {
++            let mouse_y_delta = y as f32 - self.ctx.mouse().y as f32;
++            if let Some(drag_event) = self.ctx.display().scrollbar.apply_mouse_delta(mouse_y_delta)
++            {
++                self.ctx.scroll(drag_event);
++            }
++        }
++
+         self.ctx.mouse_mut().x = x;
+         self.ctx.mouse_mut().y = y;
+ 
+@@ -455,6 +466,10 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+         let point = self.ctx.mouse().point(&size_info, display_offset);
+         let cell_changed = old_point != point;
+ 
++        // Update mouse state and check for URL change or whether we entered scrollbar.
++        let mouse_state = self.cursor_state();
++        self.ctx.window().set_mouse_cursor(mouse_state);
++
+         // If the mouse hasn't changed cells, do nothing.
+         if !cell_changed
+             && self.ctx.mouse().cell_side == cell_side
+@@ -466,10 +481,6 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+         self.ctx.mouse_mut().inside_text_area = inside_text_area;
+         self.ctx.mouse_mut().cell_side = cell_side;
+ 
+-        // Update mouse state and check for URL change.
+-        let mouse_state = self.cursor_state();
+-        self.ctx.window().set_mouse_cursor(mouse_state);
+-
+         // Prompt hint highlight update.
+         self.ctx.mouse_mut().hint_highlight_dirty = true;
+ 
+@@ -504,7 +515,8 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+         let half_cell_width = (size_info.cell_width() / 2.0) as usize;
+ 
+         let additional_padding =
+-            (size_info.width() - size_info.padding_right() - size_info.padding_left()) % size_info.cell_width();
++            (size_info.width() - size_info.padding_left() - size_info.padding_right())
++                % size_info.cell_width();
+         let end_of_grid = size_info.width() - size_info.padding_right() - additional_padding;
+ 
+         if cell_x > half_cell_width
+@@ -637,6 +649,15 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+ 
+     /// Handle left click selection and vi mode cursor movement.
+     fn on_left_click(&mut self, point: Point) {
++        if self.ctx.config().scrollbar.mode != ScrollbarMode::Never {
++            let size_info = self.ctx.size_info();
++            let mouse_x = self.ctx.mouse().x;
++            let mouse_y = self.ctx.mouse().y;
++            if self.ctx.display().scrollbar.try_start_drag(size_info, mouse_x, mouse_y) {
++                return;
++            };
++        }
++
+         let side = self.ctx.mouse().cell_side;
+ 
+         match self.ctx.mouse().click_state {
+@@ -672,6 +693,15 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+     }
+ 
+     fn on_mouse_release(&mut self, button: MouseButton) {
++        if self.ctx.config().scrollbar.mode != ScrollbarMode::Never
++            && self.ctx.display().scrollbar.is_dragging()
++        {
++            self.ctx.display().scrollbar.stop_dragging();
++            // Mouse icon is different, when not scrolling.
++            let mouse_state = self.cursor_state();
++            self.ctx.window().set_mouse_cursor(mouse_state);
++        }
++
+         if !self.ctx.modifiers().state().shift_key() && self.ctx.mouse_mode() {
+             let code = match button {
+                 MouseButton::Left => 0,
+@@ -697,6 +727,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+         if let MouseButton::Left | MouseButton::Right = button {
+             // Copy selection on release, to prevent flooding the display server.
+             self.ctx.copy_selection(ClipboardType::Selection);
++            self.ctx.stop_selection();
+         }
+     }
+ 
+@@ -827,11 +858,29 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+ 
+     /// Handle beginning of touch input.
+     pub fn on_touch_start(&mut self, touch: TouchEvent) {
+-        let touch_purpose = self.ctx.touch_purpose();
+-        *touch_purpose = match mem::take(touch_purpose) {
+-            TouchPurpose::None => TouchPurpose::Tap(touch),
++        let old_touch_purpose = mem::take(self.ctx.touch_purpose());
++        let new_touch_purpose = match old_touch_purpose {
++            TouchPurpose::None => {
++                if self.ctx.config().scrollbar.mode == ScrollbarMode::Never {
++                    TouchPurpose::Tap(touch)
++                } else {
++                    let size_info = self.ctx.size_info();
++                    let mouse_x = touch.location.x as usize;
++                    let mouse_y = touch.location.y as usize;
++                    if self.ctx.display().scrollbar.try_start_drag(size_info, mouse_x, mouse_y) {
++                        TouchPurpose::ScrollbarDrag(touch)
++                    } else {
++                        TouchPurpose::Tap(touch)
++                    }
++                }
++            },
+             TouchPurpose::Tap(start) => TouchPurpose::Zoom(TouchZoom::new((start, touch))),
+             TouchPurpose::Zoom(zoom) => TouchPurpose::Invalid(zoom.slots()),
++            TouchPurpose::ScrollbarDrag(event) => {
++                let mut set = HashSet::default();
++                set.insert(event.id);
++                TouchPurpose::Invalid(set)
++            },
+             TouchPurpose::Scroll(event) | TouchPurpose::Select(event) => {
+                 let mut set = HashSet::default();
+                 set.insert(event.id);
+@@ -842,6 +891,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+                 TouchPurpose::Invalid(slots)
+             },
+         };
++        *self.ctx.touch_purpose() = new_touch_purpose;
+     }
+ 
+     /// Handle touch input movement.
+@@ -872,6 +922,9 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+                     self.on_touch_motion(touch);
+                 }
+             },
++            TouchPurpose::ScrollbarDrag(_) => {
++                // Don't handle drag as this is already done for WInitEvent::CursorMoved.
++            },
+             TouchPurpose::Zoom(zoom) => {
+                 let font_delta = zoom.font_delta(touch);
+                 self.ctx.change_font_size(font_delta);
+@@ -905,6 +958,10 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+                 self.mouse_input(ElementState::Pressed, MouseButton::Left);
+                 self.mouse_input(ElementState::Released, MouseButton::Left);
+             },
++            TouchPurpose::ScrollbarDrag { .. } => {
++                *touch_purpose = Default::default();
++                self.ctx.display().scrollbar.stop_dragging();
++            },
+             // Invalidate zoom once a finger was released.
+             TouchPurpose::Zoom(zoom) => {
+                 let mut slots = zoom.slots();
+@@ -1178,6 +1235,18 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
+ 
+     /// Icon state of the cursor.
+     fn cursor_state(&mut self) -> CursorIcon {
++        if self.ctx.config().scrollbar.mode != ScrollbarMode::Never {
++            if self.ctx.display().scrollbar.is_dragging() {
++                return CursorIcon::RowResize;
++            }
++            let display_size = self.ctx.size_info();
++            let mouse_x = self.ctx.mouse().x;
++            let mouse_y = self.ctx.mouse().y;
++            if self.ctx.display().scrollbar.contains_mouse_pos(display_size, mouse_x, mouse_y) {
++                return CursorIcon::Default;
++            }
++        }
++
+         let display_offset = self.ctx.terminal().grid().display_offset();
+         let point = self.ctx.mouse().point(&self.ctx.size_info(), display_offset);
+         let hyperlink = self.ctx.terminal().grid()[point].hyperlink();
+@@ -1381,6 +1450,7 @@ mod tests {
+                     0.,
+                     0.,
+                     0.,
++                    0.,
+                     false,
+                 );
+ 
+diff --git a/alacritty/src/message_bar.rs b/alacritty/src/message_bar.rs
+index d4d9e699..a5e9c378 100644
+--- a/alacritty/src/message_bar.rs
++++ b/alacritty/src/message_bar.rs
+@@ -200,7 +200,7 @@ mod tests {
+         let input = "a";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(7., 10., 1., 1., 0., 0., 0., 0., false);
++        let size = SizeInfo::new(7., 10., 1., 1., 0., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+@@ -212,7 +212,7 @@ mod tests {
+         let input = "fo\nbar";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(6., 10., 1., 1., 0., 0., 0., 0., false);
++        let size = SizeInfo::new(6., 10., 1., 1., 0., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+@@ -224,7 +224,7 @@ mod tests {
+         let input = "a\nb";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(6., 10., 1., 1., 0., 0., 0., 0., false);
++        let size = SizeInfo::new(6., 10., 1., 1., 0., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+@@ -236,7 +236,7 @@ mod tests {
+         let input = "foobar1";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(6., 10., 1., 1., 0., 0., 0., 0., false);
++        let size = SizeInfo::new(6., 10., 1., 1., 0., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+@@ -248,7 +248,7 @@ mod tests {
+         let input = "foobar";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(6., 0., 1., 1., 0., 0., 0., 0., false);
++        let size = SizeInfo::new(6., 0., 1., 1., 0., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+@@ -260,7 +260,7 @@ mod tests {
+         let input = "hahahahahahahahahahaha truncate this because it's too long for the term";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(22., (MIN_FREE_LINES + 2) as f32, 1., 1., 0., 0., 0., 0., false);
++        let size = SizeInfo::new(22., (MIN_FREE_LINES + 2) as f32, 1., 1., 0., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+@@ -275,7 +275,7 @@ mod tests {
+         let input = "ha";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(2., 10., 1., 1., 0., 0., 0., 0., false);
++        let size = SizeInfo::new(2., 10., 1., 1., 0., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+@@ -287,7 +287,7 @@ mod tests {
+         let input = "hahahahahahahahaha";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(2., (MIN_FREE_LINES + 2) as f32, 1., 1., 0., 0., 0., 0., false);
++        let size = SizeInfo::new(2., (MIN_FREE_LINES + 2) as f32, 1., 1., 0., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+@@ -299,7 +299,7 @@ mod tests {
+         let input = "test";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(5., 10., 1., 1., 0., 0., 0., 0., false);
++        let size = SizeInfo::new(5., 10., 1., 1., 0., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+@@ -349,7 +349,7 @@ mod tests {
+         let input = "a\nbc defg";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(5., 10., 1., 1., 0., 0., 0., 0., false);
++        let size = SizeInfo::new(5., 10., 1., 1., 0., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+@@ -365,7 +365,7 @@ mod tests {
+         let input = "ab\nc 👩d fgh";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(7., 10., 1., 1., 0., 0., 0., 0., false);
++        let size = SizeInfo::new(7., 10., 1., 1., 0., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+@@ -381,7 +381,7 @@ mod tests {
+         let input = "\n0 1 2 3";
+         let mut message_buffer = MessageBuffer::default();
+         message_buffer.push(Message::new(input.into(), MessageType::Error));
+-        let size = SizeInfo::new(3., 10., 1., 1., 0., 0., 0., 0., false);
++        let size = SizeInfo::new(3., 10., 1., 1., 0., 0., 0., 0., 0., false);
+ 
+         let lines = message_buffer.message().unwrap().text(&size);
+ 
+diff --git a/alacritty/src/renderer/rects.rs b/alacritty/src/renderer/rects.rs
+index e10adf31..1f4c61a9 100644
+--- a/alacritty/src/renderer/rects.rs
++++ b/alacritty/src/renderer/rects.rs
+@@ -471,7 +471,6 @@ impl RectShaderProgram {
+                 gl::Uniform1f(u_padding_y, padding_y);
+             }
+             if let Some(u_padding_x) = self.u_padding_x {
+-                // FIXME update shaders to padding_left and padding_right
+                 gl::Uniform1f(u_padding_x, size_info.padding_left());
+             }
+             if let Some(u_underline_position) = self.u_underline_position {
+diff --git a/alacritty/src/scheduler.rs b/alacritty/src/scheduler.rs
+index ea8e6271..cb2ee3e7 100644
+--- a/alacritty/src/scheduler.rs
++++ b/alacritty/src/scheduler.rs
+@@ -29,6 +29,7 @@ pub enum Topic {
+     BlinkCursor,
+     BlinkTimeout,
+     Frame,
++    ScrollbarRedraw,
+ }
+ 
+ /// Event scheduled to be emitted at a specific time.
+diff --git a/alacritty_terminal/src/selection.rs b/alacritty_terminal/src/selection.rs
+index 31b7b309..fe8974ca 100644
+--- a/alacritty_terminal/src/selection.rs
++++ b/alacritty_terminal/src/selection.rs
+@@ -119,6 +119,8 @@ pub enum SelectionType {
+ pub struct Selection {
+     pub ty: SelectionType,
+     region: Range<Anchor>,
++    // Whether the selection is not yet finished.
++    pub active: bool,
+ }
+ 
+ impl Selection {
+@@ -126,6 +128,7 @@ impl Selection {
+         Self {
+             region: Range { start: Anchor::new(location, side), end: Anchor::new(location, side) },
+             ty,
++            active: true,
+         }
+     }
+ 
+diff --git a/extra/man/alacritty.5.scd b/extra/man/alacritty.5.scd
+index 0d4c28cf..64739c2e 100644
+--- a/extra/man/alacritty.5.scd
++++ b/extra/man/alacritty.5.scd
+@@ -936,6 +936,44 @@ bindings = [++
+ 	{ key = _"N"_, mods = _"Control|Shift"_, action = _"CreateNewWindow"_ },++
+ ]
+ 
++# Scrollbar
++
++This section documents the *[scrollbar]* table of the configuration file.
++The scrollbar is always one cell wide and at least two cells high.
++
++*mode* "Never" | "Fading" | "Always"
++
++	Determines when the scrollbar is shown. _"Fading"_ will show the scrollbar
++	after the visible area changed (e.g. by scrolling or writing new lines).
++	After _fade_wait_in_secs_, it will fade out. Only _"Always"_ will reserve
++	space for the scrollbar and padding. _"Fading"_ works as overlay.
++
++	Default: _"Never"_
++
++*color* <string>
++
++	The color of the scrollbar.
++
++	Default: _"#7f7f7f"_
++
++*opacity* <float>
++
++	Scrollbar opacity as a floating point number from _0.0_ to _1.0_. The value
++	\_0.0_ is completely transparent, and has the same effect as mode _"Never"_
++	with more computation. The value _1.0_ is opaque. Note, that the scrollbar
++	does not reduce the writable area in _"Fading"_ mode, so a value of _1.0_
++	could hide characters, if _window.padding.x_ allows characters behind the
++	scrollbar.
++
++	Default: _0.5_
++
++*fade_time_in_secs* <float>
++
++	Time (in seconds) the scrollbar takes to disappear in _"Fading"_-_mode_.
++	The scrollbar fades out linearly after 80% of this time has passed. This
++	property has no effect in other modes.
++
++	Default: _2.0_
+ 
+ # Debug
+ 
+-- 
+2.41.0
+
