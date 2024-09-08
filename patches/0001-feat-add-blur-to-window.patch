@@ -1,7 +1,7 @@
 From 17461a68a2f2d8403074615945bbfbd84b066569 Mon Sep 17 00:00:00 2001
 From: nenw <khi@nenw.dev>
 Date: Sat, 11 Nov 2023 14:59:57 +0900
-Subject: [PATCH 1/5] feat: add blur to window
+Subject: [PATCH 1/6] feat: add blur to window
 
 ---
  alacritty/src/window_context.rs | 2 ++

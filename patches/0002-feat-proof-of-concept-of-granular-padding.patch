@@ -1,7 +1,7 @@
 From daab8233c1364240d288646727435a1911367811 Mon Sep 17 00:00:00 2001
 From: nenw <khi@nenw.dev>
 Date: Sat, 11 Nov 2023 15:47:01 +0900
-Subject: [PATCH 2/5] feat: proof-of-concept of granular padding
+Subject: [PATCH 2/6] feat: proof-of-concept of granular padding
 
 ---
  alacritty/src/config/ui_config.rs  | 13 +++++

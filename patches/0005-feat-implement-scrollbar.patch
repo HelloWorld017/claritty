@@ -1,14 +1,14 @@
-From 09db0c011a2a2892b0cff192d02c7f28a1280e3c Mon Sep 17 00:00:00 2001
+From 28e25f37b6abbe35989bd6ef2e404e6186d0c5db Mon Sep 17 00:00:00 2001
 From: Lars Frost <freezinglava@proton.me>
 Date: Mon, 11 Sep 2023 17:03:35 +0200
-Subject: [PATCH 5/5] feat: implement scrollbar
+Subject: [PATCH 5/6] feat: implement scrollbar
 
 ---
  CHANGELOG.md                        |   1 +
- alacritty/src/config/ui_config.rs   |  48 ++++++
+ alacritty/src/config/ui_config.rs   |  42 +++++
  alacritty/src/display/damage.rs     |   1 +
- alacritty/src/display/mod.rs        |  91 +++++++++-
- alacritty/src/display/scrollbar.rs  | 252 ++++++++++++++++++++++++++++
+ alacritty/src/display/mod.rs        |  92 +++++++++-
+ alacritty/src/display/scrollbar.rs  | 253 ++++++++++++++++++++++++++++
  alacritty/src/event.rs              |  25 ++-
  alacritty/src/input.rs              |  86 +++++++++-
  alacritty/src/message_bar.rs        |  24 +--
@@ -16,7 +16,7 @@ Subject: [PATCH 5/5] feat: implement scrollbar
  alacritty/src/scheduler.rs          |   1 +
  alacritty_terminal/src/selection.rs |   3 +
  extra/man/alacritty.5.scd           |  38 +++++
- 12 files changed, 540 insertions(+), 31 deletions(-)
+ 12 files changed, 536 insertions(+), 31 deletions(-)
  create mode 100644 alacritty/src/display/scrollbar.rs
 
 diff --git a/CHANGELOG.md b/CHANGELOG.md
@@ -32,21 +32,18 @@ index 51588864..b9366e85 100644
  - Config option `persist` in `hints` config section
  - Support for dynamically loading conpty.dll on Windows
 diff --git a/alacritty/src/config/ui_config.rs b/alacritty/src/config/ui_config.rs
-index b848081e..2c437bc9 100644
+index b848081e..e68edae5 100644
 --- a/alacritty/src/config/ui_config.rs
 +++ b/alacritty/src/config/ui_config.rs
-@@ -13,6 +13,10 @@ use unicode_width::UnicodeWidthChar;
- use winit::keyboard::{Key, KeyLocation, ModifiersState};
+@@ -29,6 +29,7 @@ use crate::config::selection::Selection;
+ use crate::config::terminal::Terminal;
+ use crate::config::window::WindowConfig;
+ use crate::config::LOG_TARGET_CONFIG;
++use crate::display::color::Rgb;
  
- use alacritty_config_derive::{ConfigDeserialize, SerdeReplace};
-+use alacritty_terminal::config::{
-+    Config as TerminalConfig, Percentage, Program, LOG_TARGET_CONFIG,
-+};
-+use alacritty_terminal::term::color::Rgb;
- use alacritty_terminal::term::search::RegexSearch;
- 
- use crate::config::bell::BellConfig;
-@@ -98,6 +102,8 @@ pub struct UiConfig {
+ /// Regex used for the default URL hint.
+ #[rustfmt::skip]
+@@ -98,6 +99,8 @@ pub struct UiConfig {
      /// Keyboard configuration.
      keyboard: Keyboard,
  
@@ -55,19 +52,15 @@ index b848081e..2c437bc9 100644
      /// Should draw bold text with brighter colors instead of bold font.
      #[config(deprecated = "use colors.draw_bold_text_with_bright_colors instead")]
      draw_bold_text_with_bright_colors: bool,
-@@ -132,7 +138,11 @@ impl Default for UiConfig {
-             scrolling: Default::default(),
+@@ -133,6 +136,7 @@ impl Default for UiConfig {
              selection: Default::default(),
              keyboard: Default::default(),
-+<<<<<<< HEAD
              terminal: Default::default(),
-+=======
 +            scrollbar: Default::default(),
-+>>>>>>> 3e532ce4 (Add non-interactive scrollbar)
              import: Default::default(),
              cursor: Default::default(),
              window: Default::default(),
-@@ -281,6 +291,44 @@ where
+@@ -281,6 +285,44 @@ where
      Ok(bindings)
  }
  
@@ -125,7 +118,7 @@ index 8e1ee8b9..e296d486 100644
          )
          .into();
 diff --git a/alacritty/src/display/mod.rs b/alacritty/src/display/mod.rs
-index 286d188d..3b2544f6 100644
+index 286d188d..ae5a5c05 100644
 --- a/alacritty/src/display/mod.rs
 +++ b/alacritty/src/display/mod.rs
 @@ -33,6 +33,7 @@ use alacritty_terminal::vte::ansi::{CursorShape, NamedColor};
@@ -245,7 +238,7 @@ index 286d188d..3b2544f6 100644
          self.colors = List::from(&config.colors);
      }
  
-@@ -1093,6 +1117,53 @@ impl Display {
+@@ -1093,6 +1117,54 @@ impl Display {
          dirty
      }
  
@@ -277,11 +270,12 @@ index 286d188d..3b2544f6 100644
 +        };
 +        let bg_rect = self.scrollbar.bg_rect(self.size_info);
 +        let scrollbar_rect = self.scrollbar.rect_from_bg_rect(bg_rect, self.size_info);
++        let x = (scrollbar_rect.x - scrollbar_rect.width) as f32;
 +        let y = self.size_info.height - (scrollbar_rect.y + scrollbar_rect.height) as f32;
 +        if opacity != 0. {
 +            rects.push(RenderRect::new(
-+                scrollbar_rect.x as f32,
-+                y,
++                x,
++                y as f32,
 +                scrollbar_rect.width as f32,
 +                scrollbar_rect.height as f32,
 +                config.color,
@@ -299,7 +293,7 @@ index 286d188d..3b2544f6 100644
      #[inline(never)]
      fn draw_ime_preview(
          &mut self,
-@@ -1432,10 +1503,19 @@ impl Display {
+@@ -1432,10 +1504,19 @@ impl Display {
  
          let window_id = self.window.id();
          let timer_id = TimerId::new(Topic::Frame, window_id);
@@ -320,7 +314,7 @@ index 286d188d..3b2544f6 100644
  }
  
  impl Drop for Display {
-@@ -1650,7 +1730,8 @@ fn window_size(
+@@ -1650,7 +1731,8 @@ fn window_size(
      let grid_width = cell_width * dimensions.columns.max(MIN_COLUMNS) as f32;
      let grid_height = cell_height * dimensions.lines.max(MIN_SCREEN_LINES) as f32;
  
@@ -332,10 +326,10 @@ index 286d188d..3b2544f6 100644
      PhysicalSize::new(width as u32, height as u32)
 diff --git a/alacritty/src/display/scrollbar.rs b/alacritty/src/display/scrollbar.rs
 new file mode 100644
-index 00000000..4576576f
+index 00000000..c4dc398e
 --- /dev/null
 +++ b/alacritty/src/display/scrollbar.rs
-@@ -0,0 +1,252 @@
+@@ -0,0 +1,253 @@
 +use std::time::{Duration, Instant};
 +
 +use alacritty_terminal::grid::Scroll;
@@ -467,17 +461,18 @@ index 00000000..4576576f
 +    }
 +
 +    pub fn bg_rect(&self, display_size: SizeInfo) -> Rect {
-+        let scrollbar_margin_y = display_size.padding_y();
-+        let scrollbar_margin_x = display_size.padding_right()
++        let scrollbar_margin_y = display_size.padding_top() + display_size.padding_bottom();
++        let scrollbar_margin_x = 0.
 +            - self.config.additional_padding(display_size.cell_width, display_size.padding_left());
 +
-+        let background_area_height: f32 = display_size.height - 2. * scrollbar_margin_y;
++        let background_area_height: f32 = display_size.height - scrollbar_margin_y;
 +
 +        let scrollbar_width = display_size.cell_width;
 +        let x = display_size.width - scrollbar_width - scrollbar_margin_x;
++        let y = display_size.padding_bottom();
 +        Rect {
 +            x: x.floor() as i32,
-+            y: scrollbar_margin_y.floor() as i32,
++            y: y.floor() as i32,
 +            width: scrollbar_width.ceil() as i32,
 +            height: background_area_height.ceil() as i32,
 +        }

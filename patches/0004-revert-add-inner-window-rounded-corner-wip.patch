@@ -1,7 +1,7 @@
 From 7c91716f8979ccd8604d71c5922b23d954be3e3c Mon Sep 17 00:00:00 2001
 From: nenw <khi@nenw.dev>
 Date: Sat, 11 Nov 2023 18:52:04 +0900
-Subject: [PATCH 4/5] revert: add inner window rounded-corner (wip)
+Subject: [PATCH 4/6] revert: add inner window rounded-corner (wip)
 
 This reverts commit 14d4104da2bd7bc234b38e63fe5de5ccf0cdbd9e.
 ---
